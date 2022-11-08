@@ -29,6 +29,7 @@ import (
 )
 
 var errSniffingTimeout = newError("timeout on sniffing")
+var restrictedIPs string
 
 type cachedReader struct {
 	sync.Mutex
@@ -98,27 +99,10 @@ type DefaultDispatcher struct {
 	dns    dns.Client
 	fdns   dns.FakeDNSEngine
 }
-var blockedIPs string
 
 func init() {
-	intvalSecond := 10 * time.Second
-	ticker := time.NewTicker(intvalSecond)
-	quit := make(chan struct{})
-	go func() {
-		intvalSecond = 30 * time.Second
-		for {
-		select {
-			case <- ticker.C:
-				blockedIPsByte, _ := os.ReadFile("./bin/blockedIPs")
-				blockedIPs = string(blockedIPsByte)
-				newError("getting  blockedIPs:", blockedIPs).AtDebug().WriteToLog()
-
-			case <- quit:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
+	// init read restricted IPs timer (first time every 10s,next times every 30s)
+	initRestrictedIPs()
 
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		d := new(DefaultDispatcher)
@@ -238,20 +222,10 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network, sn
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	}
-	// drop disAllowed IP
-	sessionInbounds := session.InboundFromContext(ctx)
-	userIP := sessionInbounds.Source.Address.String()
-	blockedIPs, err := os.ReadFile("./bin/blockedIPs")
-	lines := ss.Split(string(blockedIPs), ",")
+	
+	// check and drop Restricted Connections
+	dropRestrictedConnections(ctx,outboundLink,inboundLink)
 
-	if(contains(lines,userIP)){
-		newError("IP Limited: ",userIP ,err).AtDebug().WriteToLog(session.ExportIDToError(ctx))
-		common.Close(outboundLink.Writer)
-		common.Close(inboundLink.Writer)
-		common.Interrupt(outboundLink.Reader)
-		common.Interrupt(inboundLink.Reader)
-
-	}
 	sessionInbound := session.InboundFromContext(ctx)
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
@@ -282,6 +256,17 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network, sn
 
 	return inboundLink, outboundLink
 }
+func getOsArgValue(s []string, flags... string) string {
+	for i, v := range s {
+		for _, flagVal := range flags {
+			if v == flagVal {
+				return s[i + 1]
+			}
+		}
+	}
+
+	return ""
+}
 func contains(s []string, str string) bool {
 	for _, v := range s {
 		if v == str {
@@ -289,6 +274,49 @@ func contains(s []string, str string) bool {
 		}
 	}
 	return false
+}
+func initRestrictedIPs(){
+	intvalSecond := 10 * time.Second
+	ticker := time.NewTicker(intvalSecond)
+	quit := make(chan struct{})
+	restrictedIPsPath := getOsArgValue(os.Args,"-restrictedIPsPath","-rip")
+	if restrictedIPsPath == "" {
+		return
+	}
+	go func() {
+		intvalSecond = 30 * time.Second
+		for {
+		select {
+			case <- ticker.C:
+				restrictedIPsByte, err := os.ReadFile(restrictedIPsPath)
+				restrictedIPs = string(restrictedIPsByte)
+				newError("getting  restrictedIPs:", restrictedIPs,err).AtDebug().WriteToLog()
+
+			case <- quit:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+func dropRestrictedConnections(ctx context.Context,outboundLink *transport.Link,inboundLink *transport.Link){
+	if restrictedIPs == ""{
+		return
+	}
+	// Drop Restricted Connections
+	sessionInbounds := session.InboundFromContext(ctx)
+	userIP := sessionInbounds.Source.Address.String()
+	IPs := ss.Split(string(restrictedIPs), ",")
+
+	if(contains(IPs,userIP)){
+		newError("IP Limited: ",userIP).AtDebug().WriteToLog(session.ExportIDToError(ctx))
+		common.Close(outboundLink.Writer)
+		common.Close(inboundLink.Writer)
+		common.Interrupt(outboundLink.Reader)
+		common.Interrupt(inboundLink.Reader)
+
+	}
+
 }
 func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) bool {
 	domain := result.Domain()
